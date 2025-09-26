@@ -1,0 +1,32 @@
+{
+  "name": "movieflix-dashboard",
+  "version": "1.0.0",
+  "description": "MovieFlix Dashboard - A comprehensive movie analytics and search platform",
+  "main": "server.js",
+  "scripts": {
+    "dev": "concurrently \"npm run server\" \"npm run client\"",
+    "server": "cd backend && npm run dev",
+    "client": "cd frontend && npm start",
+    "build": "cd frontend && npm run build",
+    "install-deps": "npm install && cd frontend && npm install && cd ../backend && npm install",
+    "heroku-postbuild": "cd frontend && npm install && npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/yourusername/movieflix-dashboard.git"
+  },
+  "keywords": [
+    "movies",
+    "dashboard",
+    "analytics",
+    "react",
+    "nodejs",
+    "mongodb",
+    "omdb-api"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "devDependencies": {
+    "concurrently": "^8.2.0"
+  }
+}
