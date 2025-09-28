@@ -342,3 +342,5 @@ Express.js for the backend
 
 MongoDB Atlas for cloud database hosting
 
+## Screenshots
+

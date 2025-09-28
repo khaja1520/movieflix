@@ -1,75 +1,51 @@
 import React from 'react';
-import { BrowserRouter as Router, Routes, Route, Navigate } from 'react-router-dom';
-import { Toaster } from 'react-hot-toast';
-
-// Context providers
-import { AuthProvider } from './contexts/AuthContext';
-import { ThemeProvider } from './contexts/ThemeContext';
-
-// Components
-import Layout from './components/Layout/Layout';
-import ProtectedRoute from './components/Auth/ProtectedRoute';
-
-// Pages
+import { BrowserRouter as Router, Routes, Route, Link, useNavigate } from 'react-router-dom';
 import Home from './pages/Home';
-import MovieDetails from './pages/MovieDetails';
-import Dashboard from './pages/Dashboard';
-import Stats from './pages/Stats';
 import Login from './pages/Login';
+import StatsDashboard from './pages/StatsDashboard';
+import MovieDetails from './pages/MovieDetails'; // Add MovieDetails component import
+import './styles/global.css';
 
-// Styles
-import './styles/globals.css';
+const Header = () => {
+  const navigate = useNavigate();
+  const isLoggedIn = localStorage.getItem('token'); // Check if the token exists
+
+  const handleLogout = () => {
+    localStorage.removeItem('token');
+    navigate('/');
+  };
+
+  return (
+    <header className="bg-gray-800 text-white p-4 flex justify-between items-center">
+      <nav className="flex gap-6 items-center">
+        <Link to="/" className="hover:text-yellow-400 font-semibold">MovieFlix</Link>
+        {isLoggedIn && <Link to="/stats" className="hover:text-yellow-400">Stats</Link>}
+      </nav>
+      <div>
+        {isLoggedIn ? (
+          <button onClick={handleLogout} className="btn-logout">Logout</button>
+        ) : (
+          <Link to="/login" className="btn-primary">Login</Link>
+        )}
+      </div>
+    </header>
+  );
+};
 
 function App() {
   return (
-    <ThemeProvider>
-      <AuthProvider>
-        <Router>
-          <div className="App min-h-screen bg-gray-50 dark:bg-gray-900 transition-colors">
-            <Toaster
-              position="top-right"
-              toastOptions={{
-                duration: 4000,
-                style: {
-                  background: '#363636',
-                  color: '#fff',
-                },
-                success: {
-                  duration: 3000,
-                  theme: {
-                    primary: 'green',
-                    secondary: 'black',
-                  },
-                },
-              }}
-            />
-            
-            <Routes>
-              {/* Public routes */}
-              <Route path="/login" element={<Login />} />
-              
-              {/* Protected routes with layout */}
-              <Route path="/" element={<Layout />}>
-                <Route index element={<Home />} />
-                <Route path="dashboard" element={<Dashboard />} />
-                <Route path="movie/:id" element={<MovieDetails />} />
-                <Route 
-                  path="stats" 
-                  element={
-                    <ProtectedRoute>
-                      <Stats />
-                    </ProtectedRoute>
-                  } 
-                />
-              </Route>
-              
-              {/* Catch all route */}
-              <Route path="*" element={<Navigate to="/" replace />} />
-            </Routes>
-          </div>
-        </Router>
-      </AuthProvider>
-    </ThemeProvider>
+    <Router>
+      <Header />
+      <main className="min-h-screen bg-gray-50">
+        <Routes>
+          <Route path="/" element={<Home />} />
+          <Route path="/login" element={<Login />} />
+          <Route path="/stats" element={<StatsDashboard />} />
+          <Route path="/movie/:id" element={<MovieDetails />} /> {/* Add Movie Details route */}
+          <Route path="*" element={<p className="p-4">Page Not Found</p>} />
+        </Routes>
+      </main>
+    </Router>
   );
 }
 

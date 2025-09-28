@@ -1,339 +1,166 @@
+const axios = require('axios');
 const Movie = require('../models/Movie');
-const omdbService = require('../services/omdbService');
-const cacheService = require('../services/cacheService');
-const { validationResult } = require('express-validator');
+const cache = require('../services/cacheService');
 
-// Search movies with caching
-exports.searchMovies = async (req, res) => {
+const OMDB_URL = `http://www.omdbapi.com/?apikey=${process.env.OMDB_API_KEY}`;
+const TTL_HOURS = parseInt(process.env.CACHE_EXPIRY_HOURS) || 24;
+
+function isStale(movie) {
+  if (!movie.lastFetched) return true;
+  const ageMs = Date.now() - new Date(movie.lastFetched).getTime();
+  return ageMs > TTL_HOURS * 3600 * 1000;
+}
+
+async function fetchFromOmdbById(id) {
+  const resp = await axios.get(`${OMDB_URL}&i=${id}`);
+  return resp.data;
+}
+
+async function fetchFromOmdbSearch(query) {
+  if (!query) {
+    throw new Error('Search query parameter is missing');
+  }
+  const url = `${OMDB_URL}&s=${encodeURIComponent(query)}`;
+  console.log('Fetching OMDb API URL:', url);
+  const resp = await axios.get(url);
+  return resp.data;
+}
+
+exports.searchMovies = async (req, res, next) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({
-        success: false,
-        message: 'Validation errors',
-        errors: errors.array()
-      });
+    const { search, sort, filter, page = 1, limit = 10 } = req.query;
+
+    if (!search || search.trim() === '') {
+      return res.status(400).json({ success: false, message: 'Missing or empty search query parameter' });
     }
 
-    const {
-      search,
-      sort = 'relevance',
-      filter,
-      page = 1,
-      limit = 10,
-      year,
-      type = 'movie'
-    } = req.query;
-
-    if (!search) {
-      return res.status(400).json({
-        success: false,
-        message: 'Search query is required'
-      });
+    const cacheKey = `search_${search}_${sort || ''}_${filter || ''}_${page}_${limit}`;
+    const cached = cache.get(cacheKey);
+    if (cached) {
+      console.log('Returning cached results');
+      return res.json(cached);
     }
 
-    const pageNum = parseInt(page);
-    const limitNum = parseInt(limit);
-    const skip = (pageNum - 1) * limitNum;
-
-    // Build filter object
-    let mongoFilter = {};
-    
-    // Text search
-    if (search) {
-      mongoFilter.$text = { $search: search };
+    const data = await fetchFromOmdbSearch(search);
+    if (data.Response === 'False') {
+      return res.status(404).json({ success: false, message: data.Error || 'No movies found' });
     }
 
-    // Year filter
-    if (year) {
-      mongoFilter.year = parseInt(year);
-    }
+    const results = data.Search || [];
 
-    // Type filter
-    if (type && type !== 'all') {
-      mongoFilter.type = type;
-    }
+    // Fetch & upsert full movie data concurrently
+    const movies = await Promise.all(results.map(async (item) => {
+      const full = await fetchFromOmdbById(item.imdbID);
+      const updated = {
+        imdbID: full.imdbID,
+        title: full.Title,
+        year: parseInt(full.Year),
+        runtime: parseInt(full.Runtime) || 0,
+        genre: full.Genre ? full.Genre.split(',').map(g => g.trim()) : [],
+        director: full.Director,
+        actors: full.Actors ? full.Actors.split(',').map(a => a.trim()) : [],
+        plot: full.Plot,
+        rating: parseFloat(full.imdbRating) || 0,
+        lastFetched: new Date()
+      };
+      return await Movie.findOneAndUpdate(
+        { imdbID: full.imdbID },
+        updated,
+        { new: true, upsert: true, setDefaultsOnInsert: true }
+      );
+    }));
 
-    // Genre filter
-    if (filter && filter.startsWith('genre:')) {
-      const genre = filter.replace('genre:', '');
-      mongoFilter.genre = { $in: [genre] };
-    }
-
-    // Build sort object
-    let sortObj = {};
-    switch (sort) {
-      case 'rating':
-        sortObj = { imdbRating: -1 };
-        break;
-      case 'year':
-        sortObj = { year: -1 };
-        break;
-      case 'title':
-        sortObj = { title: 1 };
-        break;
-      case 'popularity':
-        sortObj = { popularity: -1 };
-        break;
-      default:
-        sortObj = { score: { $meta: 'textScore' } };
-    }
-
-    // Search in cache first
-    let cachedMovies = await Movie.find(mongoFilter)
-      .sort(sortObj)
-      .skip(skip)
-      .limit(limitNum)
-      .select('-__v');
-
-    let totalCount = await Movie.countDocuments(mongoFilter);
-
-    // If no cached results or insufficient results, fetch from API
-    if (cachedMovies.length === 0 || (cachedMovies.length < limitNum && pageNum === 1)) {
-      try {
-        const apiResults = await omdbService.searchMovies(search, pageNum, type);
-        
-        if (apiResults.Search && apiResults.Search.length > 0) {
-          // Cache the results
-          const cachedMoviePromises = apiResults.Search.map(async (movie) => {
-            try {
-              // Get full movie details
-              const fullMovie = await omdbService.getMovieDetails(movie.imdbID);
-              
-              // Save to cache
-              const cachedMovie = await cacheService.cacheMovie(fullMovie);
-              return cachedMovie;
-            } catch (error) {
-              console.error(`Error caching movie ${movie.imdbID}:`, error);
-              return null;
-            }
-          });
-
-          const newCachedMovies = await Promise.all(cachedMoviePromises);
-          const validCachedMovies = newCachedMovies.filter(movie => movie !== null);
-
-          // Re-run the search with updated cache
-          cachedMovies = await Movie.find(mongoFilter)
-            .sort(sortObj)
-            .skip(skip)
-            .limit(limitNum)
-            .select('-__v');
-
-          totalCount = await Movie.countDocuments(mongoFilter);
+    // Filtering by genre or other field (only first genre if filter is genre)
+    let filtered = movies;
+    if (filter) {
+      const [key, val] = filter.split(':');
+      filtered = filtered.filter(m => {
+        const field = m[key];
+        if (Array.isArray(field)) {
+          return field.includes(val);
         }
-      } catch (apiError) {
-        console.error('API search error:', apiError);
-        // Continue with cached results even if API fails
-      }
+        return field === val;
+      });
     }
 
-    // Update search count for found movies
-    const movieIds = cachedMovies.map(movie => movie._id);
-    await Movie.updateMany(
-      { _id: { $in: movieIds } },
-      { $inc: { searchCount: 1, popularity: 1 } }
+    // Sorting logic
+    if (sort) {
+      if (sort === 'title') {
+        filtered = filtered.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
+      } else if (['year', 'rating', 'runtime'].includes(sort)) {
+        filtered = filtered.sort((a, b) => (b[sort] || 0) - (a[sort] || 0));
+      }
+      // Add more sorting options if needed
+    }
+
+    // Pagination
+    const pageInt = Math.max(1, parseInt(page));
+    const limitInt = Math.max(1, parseInt(limit));
+    const start = (pageInt - 1) * limitInt;
+    const paginatedData = filtered.slice(start, start + limitInt);
+
+    const result = {
+      success: true,
+      total: filtered.length,
+      page: pageInt,
+      limit: limitInt,
+      data: {
+        movies: paginatedData,
+        pagination: {
+          currentPage: pageInt,
+          totalPages: Math.ceil(filtered.length / limitInt),
+          totalCount: filtered.length,
+          limit: limitInt
+        }
+      }
+    };
+
+    cache.set(cacheKey, result);
+    res.json(result);
+
+  } catch (err) {
+    console.error('Error in searchMovies:', err.message);
+    next(err);
+  }
+};
+
+exports.getMovieById = async (req, res, next) => {
+  try {
+    const id = req.params.id;
+
+    let m = await Movie.findOne({ imdbID: id });
+    if (m && !isStale(m)) {
+      return res.json({ success: true, data: m });
+    }
+
+    const full = await fetchFromOmdbById(id);
+    if (full.Response === 'False') {
+      return res.status(404).json({ success: false, message: full.Error || 'Movie not found' });
+    }
+
+    const updated = {
+      imdbID: full.imdbID,
+      title: full.Title,
+      year: parseInt(full.Year),
+      runtime: parseInt(full.Runtime) || 0,
+      genre: full.Genre ? full.Genre.split(',').map(g => g.trim()) : [],
+      director: full.Director,
+      actors: full.Actors ? full.Actors.split(',').map(a => a.trim()) : [],
+      plot: full.Plot,
+      rating: parseFloat(full.imdbRating) || 0,
+      lastFetched: new Date()
+    };
+
+    const movie = await Movie.findOneAndUpdate(
+      { imdbID: id },
+      updated,
+      { new: true, upsert: true, setDefaultsOnInsert: true }
     );
 
-    const totalPages = Math.ceil(totalCount / limitNum);
-    const hasNextPage = pageNum < totalPages;
-    const hasPrevPage = pageNum > 1;
+    res.json({ success: true, data: movie });
 
-    res.json({
-      success: true,
-      data: {
-        movies: cachedMovies,
-        pagination: {
-          currentPage: pageNum,
-          totalPages,
-          totalCount,
-          hasNextPage,
-          hasPrevPage,
-          limit: limitNum
-        }
-      }
-    });
-
-  } catch (error) {
-    console.error('Search movies error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-// Get movie details by ID
-exports.getMovieDetails = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({
-        success: false,
-        message: 'Movie ID is required'
-      });
-    }
-
-    // Check cache first
-    let movie = await Movie.findOne({
-      $or: [
-        { imdbID: id },
-        { _id: id }
-      ]
-    }).select('-__v');
-
-    // If not in cache or cache expired, fetch from API
-    if (!movie || movie.isCacheExpired) {
-      try {
-        const apiMovie = await omdbService.getMovieDetails(id);
-        movie = await cacheService.cacheMovie(apiMovie);
-      } catch (apiError) {
-        if (!movie) {
-          return res.status(404).json({
-            success: false,
-            message: 'Movie not found'
-          });
-        }
-        // Use cached version even if expired when API fails
-      }
-    }
-
-    // Increment view count
-    await movie.incrementSearchCount();
-
-    res.json({
-      success: true,
-      data: movie
-    });
-
-  } catch (error) {
-    console.error('Get movie details error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-// Get popular movies
-exports.getPopularMovies = async (req, res) => {
-  try {
-    const { limit = 10 } = req.query;
-    const limitNum = parseInt(limit);
-
-    const popularMovies = await Movie.find({})
-      .sort({ popularity: -1, imdbRating: -1 })
-      .limit(limitNum)
-      .select('-__v');
-
-    res.json({
-      success: true,
-      data: popularMovies
-    });
-
-  } catch (error) {
-    console.error('Get popular movies error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Internal server error',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-// Admin: Refresh cache for a movie
-exports.refreshMovieCache = async (req, res) => {
-  try {
-    const { id } = req.params;
-
-    if (!id) {
-      return res.status(400).json({
-        success: false,
-        message: 'Movie ID is required'
-      });
-    }
-
-    // Fetch fresh data from API
-    const apiMovie = await omdbService.getMovieDetails(id);
-    const movie = await cacheService.cacheMovie(apiMovie);
-
-    res.json({
-      success: true,
-      message: 'Movie cache refreshed successfully',
-      data: movie
-    });
-
-  } catch (error) {
-    console.error('Refresh movie cache error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to refresh movie cache',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-// Admin: Clear expired cache
-exports.clearExpiredCache = async (req, res) => {
-  try {
-    const result = await Movie.cleanupExpiredCache();
-
-    res.json({
-      success: true,
-      message: `Cleared ${result.deletedCount} expired cache entries`
-    });
-
-  } catch (error) {
-    console.error('Clear expired cache error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to clear expired cache',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
-  }
-};
-
-// Export movie data as CSV
-exports.exportMoviesCSV = async (req, res) => {
-  try {
-    const { search, filter } = req.query;
-
-    let mongoFilter = {};
-    
-    if (search) {
-      mongoFilter.$text = { $search: search };
-    }
-
-    if (filter && filter.startsWith('genre:')) {
-      const genre = filter.replace('genre:', '');
-      mongoFilter.genre = { $in: [genre] };
-    }
-
-    const movies = await Movie.find(mongoFilter)
-      .select('title year genre director imdbRating runtime type')
-      .limit(1000); // Limit to prevent large exports
-
-    // Convert to CSV format
-    const csvHeader = 'Title,Year,Genre,Director,Rating,Runtime,Type\n';
-    const csvRows = movies.map(movie => {
-      const genre = Array.isArray(movie.genre) ? movie.genre.join('; ') : movie.genre || '';
-      return `"${movie.title}",${movie.year},"${genre}","${movie.director || ''}",${movie.imdbRating || ''},"${movie.runtime || ''}","${movie.type}"`;
-    });
-
-    const csvContent = csvHeader + csvRows.join('\n');
-
-    res.setHeader('Content-Type', 'text/csv');
-    res.setHeader('Content-Disposition', 'attachment; filename="movies.csv"');
-    res.send(csvContent);
-
-  } catch (error) {
-    console.error('Export movies CSV error:', error);
-    res.status(500).json({
-      success: false,
-      message: 'Failed to export movies CSV',
-      error: process.env.NODE_ENV === 'development' ? error.message : undefined
-    });
+  } catch (err) {
+    console.error('Error in getMovieById:', err.message);
+    next(err);
   }
 };
